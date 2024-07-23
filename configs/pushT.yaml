@@ -1,0 +1,7 @@
+path: dataset/pusht_cchi_v7_replay.zarr.zip
+datashape:
+    obs_horizon: 1
+    obs_dim: 5
+    pred_horizon: 1
+    action_horizon: 1
+    action_dim: 2

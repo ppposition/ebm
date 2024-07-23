@@ -1,0 +1,10 @@
+MLP:
+    hidden_dim: 512
+    hidden_depth: 3
+    output_dim: 1
+    dropout: 0.3
+MLP_cond:
+    hidden_dim: 512
+    hidden_depth: 3
+    output_dim: 1
+    dropout: 0.3
