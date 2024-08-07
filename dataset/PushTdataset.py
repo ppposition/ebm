@@ -1,4 +1,6 @@
 import torch
+import torch.utils
+import torch.utils.data
 import zarr
 import numpy as np
 
@@ -71,46 +73,32 @@ def sample_sequence(train_data, sequence_length,
         result[key] = data
     return result
 
-class PushTdataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_path):
-        dataset_root = zarr.open(dataset_path, 'r')
-        train_data = {
-            'action':dataset_root['data']['action'][:],
-            'obs': dataset_root['data']['state'][:],
-        }
-        stats = dict()
-        normalized_train_data = dict()
-        for key, data in train_data.items():
-            stats[key] = get_data_stats(data)
-            normalized_train_data[key] = normalize_data(data, stats[key])
-        self.stats = stats
-        self.normalized_train_data = normalized_train_data
-
-    def __len__(self):
-        return len(self.normalized_train_data['action'])
-
-    def __getitem__(self, idx):
-       nsample = dict()
-       nsample['obs'] = self.normalized_train_data['obs'][idx]
-       nsample['action'] = self.normalized_train_data['action'][idx]
-
-       return nsample
-
 class PushTStateDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_path,
+    def __init__(self, dataset_path, path_size, 
                  pred_horizon, obs_horizon, action_horizon):
 
         # read from zarr dataset
         dataset_root = zarr.open(dataset_path, 'r')
-        # All demonstration episodes are concatinated in the first dimension N
-        train_data = {
-            # (N, action_dim)
-            'action': dataset_root['data']['action'][:],
-            # (N, obs_dim)
-            'obs': dataset_root['data']['state'][:]
-        }
         # Marks one-past the last index for each episode
-        episode_ends = dataset_root['meta']['episode_ends'][:]
+        if path_size==-1:
+            episode_ends = dataset_root['meta']['episode_ends'][:]
+            # All demonstration episodes are concatinated in the first dimension N
+            train_data = {
+                # (N, action_dim)
+                'action': dataset_root['data']['action'][:],
+                # (N, obs_dim)
+                'obs': dataset_root['data']['state'][:]
+            }
+        else:
+            episode_ends = dataset_root['meta']['episode_ends'][:path_size]
+            # All demonstration episodes are concatinated in the first dimension N
+            train_data = {
+                # (N, action_dim)
+                'action': dataset_root['data']['action'][:(episode_ends[-1]+1)],
+                # (N, obs_dim)
+                'obs': dataset_root['data']['state'][:(episode_ends[-1]+1)]
+            }
+            
 
         # compute start and end of each state-action sequence
         # also handles padding

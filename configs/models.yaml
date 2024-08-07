@@ -1,10 +1,12 @@
 MLP:
-    hidden_dim: 512
-    hidden_depth: 3
+    hidden_dim: 1024
+    hidden_depth: 4
     output_dim: 1
-    dropout: 0.3
+    dropout: 0.1
 MLP_cond:
-    hidden_dim: 512
+    hidden_dim: 1024
     hidden_depth: 3
     output_dim: 1
     dropout: 0.3
+Unet_1d:
+    down_dims: [256, 512, 1024]

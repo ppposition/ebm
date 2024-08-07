@@ -1,0 +1,4 @@
+noise_scale: 0.5
+inference_samples: 1024
+iters: 100
+noise_shrink: 0.5

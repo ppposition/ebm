@@ -18,10 +18,23 @@ class MLP(nn.Module):
         self.layers2 = nn.Sequential(*layers2)
         self.linear = nn.Linear(input_dim, output_dim)
     def forward(self, act, obs):
-        x = torch.cat((act.flatten(start_dim=1), obs.flatten(start_dim=1)), dim=1)
+        x = torch.cat((act.flatten(start_dim=-2), obs.flatten(start_dim=-2)), dim=-1)
         output1 = self.layers1(x) + x
         output = output1 + self.layers2(output1)
         return self.linear(output)
+
+class MLP(nn.Module):
+    def __init__(self, input_dim:int, hidden_dim:int, hidden_depth:int, output_dim:int, dropout:float) -> None:
+        super().__init__()
+        dropout_layer = partial(nn.Dropout, p=dropout)
+        layers1 = [nn.Linear(input_dim, hidden_dim), nn.ReLU(), dropout_layer()]
+        for _ in range(hidden_depth-1):
+            layers1 += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), dropout_layer()]
+        layers1.append(nn.Linear(hidden_dim, output_dim))
+        self.layers1 = nn.Sequential(*layers1)
+    def forward(self, act, obs):
+        x = torch.cat((act.flatten(start_dim=-2), obs.flatten(start_dim=-2)), dim=-1)
+        return self.layers1(x)
 
 class MLP_cond(nn.Module):
     def __init__(self, input_dim:int, hidden_dim:int, hidden_depth:int, output_dim:int, dropout:float, cond_dim:int) -> None:
@@ -134,6 +147,7 @@ class ConditionResidualBlock1D(nn.Module):
     
     def forward(self, x, cond):
         out = self.blocks[0](x)
+        cond = cond.flatten(start_dim=1)
         embed = self.cond_encoder(cond)
         embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
         scale = embed[:, 0, ...]
@@ -144,7 +158,7 @@ class ConditionResidualBlock1D(nn.Module):
         out = out + self.residual_conv(x)
         return out
 
-class EBM(nn.Module):
+class SemiUnet(nn.Module):
     def __init__(self, input_dim, global_cond_dim, down_dims=[256, 512, 1024], kernel_size=5, n_groups=8, len_seq=16, hidden_layer=1000) -> None:
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
@@ -175,12 +189,12 @@ class EBM(nn.Module):
             sum(p.numel() for p in self.parameters())
         ))
     
-    def forward(self, sample: torch.Tensor, global_cond=None):
-        sample = sample.moveaxis(-1, -2)
-        x = sample
+    def forward(self, act: torch.Tensor, obs=None):
+        act = act.moveaxis(-1, -2)
+        x = act
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
-            x = resnet(x, global_cond)
-            x = resnet2(x, global_cond)
+            x = resnet(x, obs)
+            x = resnet2(x, obs)
             x = downsample(x)
         x = self.linear2(self.activate_func(self.linear1(x.flatten(start_dim=1))))
         return x

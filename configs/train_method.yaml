@@ -1,6 +1,9 @@
 ED:
-    m_particles: 16
-    t_noise: 0.5
+    m_particles: 32
+    t_noise: 0.8
     w_stable: 1.0
     decay: 1.0
+DFO:
+    num_samples: 128
+    
     

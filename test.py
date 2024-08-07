@@ -1,7 +1,7 @@
 from environments.pushT import PushTEnv
 import torch
 from tqdm import tqdm
-from methods import langvin_sample
+from methods import langvin_sample, DFO_infer
 from dataset.PushTdataset import normalize_data, unnormalize_data
 from skvideo.io import vwrite
 from IPython.display import Video
@@ -13,7 +13,7 @@ import collections
 import pickle
 import os
 
-def generate_path(model, device, stats, path, action_dim, pred_horizon, action_horizon, obs_horizon, obs_dim, e_l_step_size, n_iters, grad_decay, decay_step, noise_scale, max_steps=200):
+def generate_path(model, device, stats, path, action_dim, pred_horizon, action_horizon, obs_horizon, obs_dim, sample_method, sample_dic, max_steps=200):
     env = PushTEnv()
     env.seed(10000)
     obs, inf = env.reset()
@@ -30,10 +30,15 @@ def generate_path(model, device, stats, path, action_dim, pred_horizon, action_h
     model.eval()
     with tqdm(total=max_steps, desc="Eval PushTStateEnv") as pbar:
         while not done:
-            nobs = normalize_data(obs, stats=stats['obs'])
+            obs_seq = np.stack(obs_deque)
+            nobs = normalize_data(obs_seq, stats=stats['obs'])
             nobs = torch.from_numpy(nobs).to(device, dtype=torch.float32)
             obs_cond = nobs.unsqueeze(0)
-            act = langvin_sample(model, act, obs_cond, e_l_step_size, n_iters, grad_decay, decay_step, noise_scale)
+            if sample_method=="DFO": 
+                act = DFO_infer(model, obs_cond, pred_horizon=pred_horizon,
+                action_dim=action_dim, **sample_dic)
+            elif sample_method=="Langevin":
+                act = langvin_sample(model, act, obs_cond, **sample_dic)
             nact = act.detach().to('cpu').numpy()
             nact = nact[0]
             action_pred = unnormalize_data(nact, stats=stats['action'])
@@ -59,7 +64,7 @@ def generate_path(model, device, stats, path, action_dim, pred_horizon, action_h
     vwrite(os.path.join(path, 'vis.mp4'), imgs)
     #Video('vis.mp4', embed=True, width=256, height=256)
     return max(rewards)
-    
+
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str)
@@ -87,5 +92,7 @@ if __name__=='__main__':
         elif args.net=='MLP_cond':
             model = MLP_cond(input_dim=data_config['pred_horizon']*data_config['action_dim'],cond_dim=data_config['obs_horizon']*data_config['obs_dim'], **model_config)
     model.load_state_dict(torch.load(args.parameter))
-    generate_path(model, device, stat, args.path, **data_config, **sample_config)
+    if not os.path.exists(args.path):
+        os.mkdir(args.path)
+    generate_path(model, device, stat, args.path, 2, noise_scale=0.5)
     
