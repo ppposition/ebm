@@ -215,13 +215,13 @@ def visualize_trajectory_with_flow_field(model, trajectory):
     plt.show()
 
 
-# Function to visualize the flow field around a given trajectory (either GT or BC)
 def visualize_flow_field_around_trajectory(
     model,
     trajectory,
-    grid_size=10,
-    grid_extent=1.0,
-    subsample_step=5,
+    denoiser=None,  # Add the denoiser as an optional argument
+    grid_size=5,
+    grid_extent=0.5,
+    subsample_step=10,
     label="Trajectory",
     traj_color="blue",
     flow_color="red",
@@ -230,9 +230,8 @@ def visualize_flow_field_around_trajectory(
     x_values = trajectory[:, 1]
     y_values = trajectory[:, 2]
 
-    plt.plot(x_values, y_values, label=f"{label}", color=traj_color)
+    plt.plot(x_values, y_values, label=label, color=traj_color)
 
-    # Sub-sample the trajectory points
     for t, x, y in zip(
         t_values[::subsample_step],
         x_values[::subsample_step],
@@ -250,7 +249,15 @@ def visualize_flow_field_around_trajectory(
                 X_tensor = torch.tensor(
                     [X_grid[i, j], Y_grid[i, j]], dtype=torch.float32
                 )
+                
+                # Calculate f(X)
                 flow = model(X_tensor).detach().numpy()
+                
+                # Add the denoising direction if denoiser is provided
+                if denoiser:
+                    denoise_correction = denoiser(X_tensor).detach().numpy()
+                    flow += denoise_correction  # Composite direction
+                
                 plt.arrow(
                     X_grid[i, j],
                     Y_grid[i, j],
@@ -337,7 +344,7 @@ def main(args):
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        denoising=not args.denoising_enabled,  # This should be `denoising_enabled`
+        denoising=not args.denoising_enabled,
     )
 
     # Train with denoising (default) unless --no-denoising is provided
@@ -420,6 +427,7 @@ def main(args):
         visualize_flow_field_around_trajectory(
             trained_model_with_denoiser,
             generated_trajectory_with_time_denoiser,
+            denoiser=denoiser,  # Pass the denoiser to include the composite direction
             grid_size=5,
             grid_extent=0.5,
             subsample_step=10,
