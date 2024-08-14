@@ -1,28 +1,28 @@
-import os
-import pickle
-import numpy as np
+import zarr
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from dataset.PushTdataset import PushTStateDataset
-from environments.pushT import PushTEnv
+from matplotlib.colors import to_rgba
 
 # Load dataset
 dataset_path = './dataset/pusht_cchi_v7_replay.zarr.zip'  # Replace with the actual dataset path
 path_size = -1  # Replace with the appropriate path_size value
-pred_horizon = 16
-obs_horizon = 2
-action_horizon = 8
 
-dataset = PushTStateDataset(dataset_path, path_size, pred_horizon, obs_horizon, action_horizon)
+dataset_root = zarr.open(dataset_path, 'r')
+if path_size == -1:
+    episode_ends = dataset_root['meta']['episode_ends'][:]
 
-# Visualize a single trajectory
-env = PushTEnv()
-env.seed(100000)
+actions = dataset_root['data']['action'][:]
+obs = dataset_root['data']['state'][:]
 
-trajectory_idx = 0  # Index of the trajectory to visualize
-
-print(f"dataset contains {len(dataset)} trajectorys")
-traj_lengths = [len(dataset[i]['obs']) for i in range(len(dataset))]
+trajs = []
+last_end_ind = 0
+for end_ind in episode_ends:
+    trajs.append({'obs': dataset_root['data']['state'][last_end_ind:end_ind],
+                  'action': dataset_root['data']['action'][last_end_ind:end_ind]})
+    last_end_ind = end_ind
+    
+print(f"dataset contains {len(episode_ends)} trajectories")
+traj_lengths = [episode_ends[i + 1] - episode_ends[i] for i in range(len(episode_ends) - 1)]
+traj_lengths.append(episode_ends[0])
 
 # Create a histogram
 plt.figure(figsize=(10, 6))
@@ -36,49 +36,57 @@ plt.ylabel('Frequency')
 # Display the histogram
 plt.show()
 
-obs_seq, action_seq = dataset[trajectory_idx]['obs'], dataset[trajectory_idx]['action']
+trajectory_idx = 0  # Index of the trajectory to visualize
+obs_seq, action_seq = trajs[trajectory_idx]['obs'], trajs[trajectory_idx]['action']
 
 fig = plt.figure()
 ax = fig.add_subplot(111, projection='3d')
 ax.set_title(f'Trajectory {trajectory_idx}')
 print(len(obs_seq))
 
+# Set the color map for the alpha scale
+cmap = plt.get_cmap('viridis')
+num_steps = len(obs_seq)
+
+# Use these lists to manage the labels
+agent_label_set = False
+block_label_set = False
+
 for i in range(len(obs_seq)):
     obs = obs_seq[i]
     action = action_seq[i]
     agent_x, agent_y, block_x, block_y, block_angle = obs
     target_agent_x, target_agent_y = action
+
+    # Compute the alpha value based on the time step
+    alpha = (i + 1) / num_steps
+
+    # Get the color with the computed alpha value
+    color = to_rgba(cmap(alpha), alpha=alpha)
+
     print(f"Obs:        [agent_x,  agent_y,  block_x,  block_y,   block_angle]")
     print(f"Obs:       {repr(obs)}")
     print(f"Action:   [target_agent_x, target_agent_y] = ")
     print(f"Action:   {repr(action)}")
 
-    ax.scatter(agent_x, agent_y, 0, color='r', label='Agent' if i == 0 else None)
-    ax.scatter(block_x, block_y, 0, color='b', label='Block' if i == 0 else None)
-    ax.quiver(agent_x, agent_y, 0, target_agent_x - agent_x, target_agent_y - agent_y, 0, color='g', label='Action' if i == 0 else None)
+    # Set labels only once to avoid cluttering the legend
+    agent_label = 'Agent' if not agent_label_set else None
+    block_label = 'Block' if not block_label_set else None
 
+    ax.scatter(agent_x, agent_y, 0, color=color, label=agent_label)
+    ax.scatter(block_x, block_y, 0, color=color, label=block_label)
+
+    agent_label_set = True
+    block_label_set = True
+
+# Adjust legend
 ax.set_xlabel('X')
 ax.set_ylabel('Y')
 ax.set_zlabel('Z')
-ax.legend()
+
+# Combine legends if necessary and ensure it's visible
+handles, labels = ax.get_legend_handles_labels()
+unique_labels = dict(zip(labels, handles))
+ax.legend(unique_labels.values(), unique_labels.keys())
+
 plt.show()
-
-# Load dataset statistics
-stats_path = 'result/68/d1.pkl'  # Replace with the actual path to the statistics file
-with open(stats_path, 'rb') as f:
-    stats = pickle.load(f)
-
-print("Dataset Statistics:")
-print(stats)
-
-# Normalize data
-def normalize_data(data, stats):
-    ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    ndata = ndata * 2 - 1
-    return ndata
-
-# Example usage: Normalize a single observation
-obs_example = obs_seq[0]
-normalized_obs = normalize_data(obs_example, stats)
-print("Normalized Observation Example:")
-print(normalized_obs)
