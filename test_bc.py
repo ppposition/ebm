@@ -59,7 +59,7 @@ def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=Fa
         for _ in range(num_samples):
             x = np.random.uniform(0, 2 * np.pi)
             y = amplitude * np.sin(freq * x)
-            dt = 0.1 #np.random.uniform(0.09, 0.11)
+            dt = np.random.uniform(0.09, 0.11)
             x_next = x + dt
             y_next = amplitude * np.sin(freq * x_next)
             trajectory.append((x, y, x_next, y_next))
