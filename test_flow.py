@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+import torchsde
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
@@ -178,23 +179,42 @@ def train_flow_matching(
     return model, denoiser
 
 
-# Global counter for function calls
-call_count = 0
+class FlowSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
+    def __init__(self, model, denoiser=None, noise_std=0.1):
+        super().__init__(noise_type="diagonal")  # Removed `sde_type`
+        self.model = model
+        self.denoiser = denoiser
+        self.noise_std = noise_std
+
+    # Drift term: f + denoising
+    def f(self, t, X):
+        with torch.no_grad():
+            flow = self.model(X)
+            if self.denoiser:
+                denoising = self.denoiser(X)
+                flow += denoising
+            return flow
+
+    # Diffusion term: σ
+    def g(self, t, X):
+        # Add isotropic noise (diagonal with constant standard deviation)
+        return self.noise_std * torch.ones_like(X)
 
 
-# Wrapper function to pass to solve_ivp that integrates using the neural network
-def neural_ode(t, X, model):
-    global call_count
-    call_count += 1  # Increment the counter on each function call
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    dX_dt = model(X_tensor).detach().numpy()
-    return dX_dt
-
-
-def generate_trajectory(model, initial_point, t_values, denoiser=None, rtol=1e-2, atol=1e-4):
+def generate_trajectory(
+    model,
+    initial_point,
+    t_values,
+    denoiser=None,
+    rtol=1e-1,
+    atol=1e-2,
+    use_sde=False,
+    sde_noise_std=0.1,
+):
     global call_count
     call_count = 0  # Reset the counter at the beginning of each integration
 
+    # ODE version: Use combined_ode with call counting
     def combined_ode(t, X):
         global call_count
         call_count += 1
@@ -205,19 +225,49 @@ def generate_trajectory(model, initial_point, t_values, denoiser=None, rtol=1e-2
             dx_dt += denoise_correction
         return dx_dt
 
-    sol = solve_ivp(
-        fun=combined_ode,
-        t_span=(t_values[0], t_values[-1]),
-        y0=initial_point,
-        t_eval=t_values,
-        method="RK23",
-        rtol=rtol,
-        atol=atol,
-    )
-    print(
-        f"Number of function calls to neural_ode: {call_count}"
-    )  # Print the number of function calls
-    return sol.y.T  # Transpose to match the shape expected by the rest of the code
+    # SDE version: Wrap the model to count function calls
+    class CountingFlowSDE(FlowSDE):
+        def f(self, t, X):
+            global call_count
+            call_count += 1
+            return super().f(t, X)
+
+    if use_sde:
+        # Use SDE solver with call counting
+        sde_model = CountingFlowSDE(model, denoiser=denoiser, noise_std=sde_noise_std)
+        initial_point_tensor = torch.tensor(
+            initial_point, dtype=torch.float32
+        ).unsqueeze(0)
+        ts = torch.tensor(t_values, dtype=torch.float32)
+        with torch.no_grad():
+            trajectory = (
+                torchsde.sdeint(
+                    sde_model,
+                    initial_point_tensor,
+                    ts,
+                    method="milstein",  # 'srk' stochastic runge-kutta, 'euler' euler-maruyama, 'milstein' milstein
+                    adaptive=True,
+                    rtol=rtol,
+                    atol=atol,
+                )
+                .squeeze(1)
+                .numpy()
+            )  # Squeeze to remove batch dimension
+    else:
+        # Use ODE solver with call counting
+        sol = solve_ivp(
+            fun=combined_ode,
+            t_span=(t_values[0], t_values[-1]),
+            y0=initial_point,
+            t_eval=t_values,
+            method="RK23",
+            rtol=rtol,
+            atol=atol,
+        )
+        trajectory = sol.y.T
+
+    print(f"Number of function calls: {call_count}")
+    return trajectory
 
 
 # Function to visualize the flow field along with the ground truth trajectory
@@ -325,39 +375,71 @@ def plot_trajectories(gt_trajectory, generated_trajectory):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Flow-based Behavior Cloning with Denoising and Noisy GT Data")
-    
+
     # Add arguments for hyperparameters
-    parser.add_argument('--num_samples', type=int, default=20, help='Number of samples in the trajectory')
-    parser.add_argument('--num_epochs', type=int, default=300, help='Number of epochs for training')
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=100,
+        help="Number of samples in the trajectory",
+    )
+    parser.add_argument(
+        "--num_epochs", type=int, default=100, help="Number of epochs for training"
+    )
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for training')
-    parser.add_argument('--noise_std', type=float, default=0.1, help='Standard deviation of Gaussian noise added for denoising')
-    parser.add_argument('--gt_noise_std', type=float, default=0.1, help='Standard deviation of Gaussian noise added to the ground truth trajectory')
+    parser.add_argument(
+        "--noise_std",
+        type=float,
+        default=0.15,
+        help="Standard deviation of Gaussian noise added for denoising",
+    )
+    parser.add_argument(
+        "--gt_noise_std",
+        type=float,
+        default=0.0,
+        help="Standard deviation of Gaussian noise added to the ground truth trajectory",
+    )
     parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance for solve_ivp')
     parser.add_argument('--atol', type=float, default=1e-4, help='Absolute tolerance for solve_ivp')
     parser.add_argument('--no-denoising', action='store_false', dest='denoising_enabled', help='Disable denoising during training')
     parser.add_argument('--sharp_turns', action='store_true', help='Add sharp turns to the trajectory')
-    parser.add_argument('--l2_reg', type=float, default=0.01, help='L2 regularization strength (weight decay)')
+    parser.add_argument(
+        "--l2_reg",
+        type=float,
+        default=0.0,
+        help="L2 regularization strength (weight decay)",
+    )
+    parser.add_argument(
+        "--use_sde", action="store_true", help="Use SDE instead of ODE for inference"
+    )
+    parser.add_argument(
+        "--sde_noise_std",
+        type=float,
+        default=0.025,
+        help="Standard deviation of the Wiener process in SDE",
+    )
 
     args = parser.parse_args()
     return args
 
 
 def main(args):
-    # Simulate the trajectory
+    # Simulate the trajectory with optional sharp turns and noise
     gt_trajectory = simulate_trajectory(
         args.num_samples,
         noise_std=args.gt_noise_std,  # Pass the ground truth noise standard deviation
         sharp_turns=args.sharp_turns  # Pass the sharp turns flag
     )
+
     # Train without denoising if --no-denoising is provided
     trained_model_no_denoiser, _ = train_flow_matching(
         gt_trajectory,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        denoising=not args.denoising_enabled,
-        l2_reg=args.l2_reg,
+        denoising=False,
+        l2_reg=args.l2_reg,  # Pass the L2 regularization strength
     )
 
     # Train with denoising (default) unless --no-denoising is provided
@@ -369,7 +451,7 @@ def main(args):
             learning_rate=args.learning_rate,
             denoising=True,
             noise_std=args.noise_std,
-            l2_reg=args.l2_reg,
+            l2_reg=args.l2_reg,  # Pass the L2 regularization strength
         )
     else:
         trained_model_with_denoiser, denoiser = None, None
@@ -386,6 +468,8 @@ def main(args):
         denoiser=None,
         rtol=args.rtol,
         atol=args.atol,
+        use_sde=args.use_sde,
+        sde_noise_std=args.sde_noise_std,
     )
 
     # With denoiser (if enabled)
@@ -397,6 +481,8 @@ def main(args):
             denoiser=denoiser,
             rtol=args.rtol,
             atol=args.atol,
+            use_sde=args.use_sde,
+            sde_noise_std=args.sde_noise_std,
         )
         generated_trajectory_with_time_denoiser = np.column_stack(
             (t_values, generated_trajectory_with_denoiser)
@@ -418,7 +504,7 @@ def main(args):
         gt_trajectory,
         grid_size=5,
         grid_extent=0.5,
-        subsample_step=10,
+        subsample_step=5,
         label="Ground Truth Trajectory",
         traj_color="blue",
         flow_color="lightblue",
@@ -430,21 +516,22 @@ def main(args):
         generated_trajectory_with_time_no_denoiser,
         grid_size=5,
         grid_extent=0.5,
-        subsample_step=2,
+        subsample_step=5,
         label="Generated Trajectory (No Denoiser)",
         traj_color="red",
         flow_color="orange",
     )
 
     # Plot Generated Trajectory with Denoiser (if enabled)
+
     if args.denoising_enabled:
         visualize_flow_field_around_trajectory(
             trained_model_with_denoiser,
             generated_trajectory_with_time_denoiser,
-            denoiser=denoiser,  # Pass the denoiser to include the composite direction
+            denoiser=denoiser,
             grid_size=5,
             grid_extent=0.5,
-            subsample_step=2,
+            subsample_step=5,
             label="Generated Trajectory (With Denoiser)",
             traj_color="green",
             flow_color="lightgreen",
