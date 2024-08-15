@@ -8,15 +8,36 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
 
-# Simulate the trajectory (as defined earlier)
-def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=False):
+# Simulate the trajectory
+def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=False, noise_std=0.0, sharp_turns=False):
+    """
+    Simulate a 2D trajectory, optionally with sharp turns and noise.
+
+    Args:
+        num_samples (int): Number of samples in the trajectory.
+        amplitude (float): Amplitude of the trajectory.
+        freq (float): Frequency of the trajectory (for sinusoidal curves).
+        random_sampling (bool): Whether to use random sampling for time steps.
+        noise_std (float): Standard deviation of Gaussian noise added to the trajectory.
+        sharp_turns (bool): Whether to add sharp turns to the trajectory.
+
+    Returns:
+        np.ndarray: The trajectory with time indices.
+    """
     if random_sampling:
         t_values = np.sort(np.random.uniform(0, 2 * np.pi, num_samples))
     else:
         t_values = np.linspace(0, 2 * np.pi, num_samples)
-
-    x_values = t_values
-    y_values = amplitude * np.sin(freq * t_values)
+    
+    if sharp_turns:
+        # Sharp turns (e.g., square wave pattern)
+        x_values = amplitude * np.sign(np.sin(freq * t_values))  # Creates sharp transitions
+        y_values = amplitude * np.sign(np.cos(freq * t_values))
+    else:
+        # Smooth sinusoidal curve
+        x_values = t_values
+        y_values = amplitude * np.sin(freq * t_values)
+    
     trajectory = np.column_stack((x_values, y_values))
 
     # Apply random rotation
@@ -26,6 +47,11 @@ def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=Fa
 
     # Add continuous time variable to the trajectory
     final_trajectory = np.column_stack((t_values, rotated_trajectory))
+
+    # Add synthetic Gaussian noise if noise_std > 0
+    if noise_std > 0:
+        noise = np.random.normal(0, noise_std, final_trajectory[:, 1:].shape)
+        final_trajectory[:, 1:] += noise
 
     return final_trajectory
 
@@ -107,6 +133,7 @@ def train_flow_matching(
     learning_rate=0.001,
     denoising=False,
     noise_std=0.1,
+    l2_reg=0.0,
 ):
     dataset = FlowMatchingDataset(trajectory, denoising=denoising, noise_std=noise_std)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -117,6 +144,7 @@ def train_flow_matching(
     optimizer = optim.Adam(
         list(model.parameters()) + (list(denoiser.parameters()) if denoiser else []),
         lr=learning_rate,
+        weight_decay=l2_reg  # Add L2 regularization here
     )
 
     for epoch in range(num_epochs):
@@ -296,39 +324,20 @@ def plot_trajectories(gt_trajectory, generated_trajectory):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Flow-based Behavior Cloning with Denoising"
-    )
-
+    parser = argparse.ArgumentParser(description="Flow-based Behavior Cloning with Denoising and Noisy GT Data")
+    
     # Add arguments for hyperparameters
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=100,
-        help="Number of samples in the trajectory",
-    )
-    parser.add_argument(
-        "--num_epochs", type=int, default=100, help="Number of epochs for training"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=32, help="Batch size for training"
-    )
-    parser.add_argument(
-        "--learning_rate", type=float, default=0.001, help="Learning rate for training"
-    )
-    parser.add_argument(
-        "--noise_std",
-        type=float,
-        default=0.1,
-        help="Standard deviation of Gaussian noise added for denoising",
-    )
-    parser.add_argument(
-        "--rtol", type=float, default=1e-1, help="Relative tolerance for solve_ivp"
-    )
-    parser.add_argument(
-        "--atol", type=float, default=1e-2, help="Absolute tolerance for solve_ivp"
-    )
+    parser.add_argument('--num_samples', type=int, default=20, help='Number of samples in the trajectory')
+    parser.add_argument('--num_epochs', type=int, default=300, help='Number of epochs for training')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for training')
+    parser.add_argument('--noise_std', type=float, default=0.1, help='Standard deviation of Gaussian noise added for denoising')
+    parser.add_argument('--gt_noise_std', type=float, default=0.1, help='Standard deviation of Gaussian noise added to the ground truth trajectory')
+    parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance for solve_ivp')
+    parser.add_argument('--atol', type=float, default=1e-4, help='Absolute tolerance for solve_ivp')
     parser.add_argument('--no-denoising', action='store_false', dest='denoising_enabled', help='Disable denoising during training')
+    parser.add_argument('--sharp_turns', action='store_true', help='Add sharp turns to the trajectory')
+    parser.add_argument('--l2_reg', type=float, default=0.01, help='L2 regularization strength (weight decay)')
 
     args = parser.parse_args()
     return args
@@ -336,8 +345,11 @@ def parse_args():
 
 def main(args):
     # Simulate the trajectory
-    gt_trajectory = simulate_trajectory(args.num_samples)
-
+    gt_trajectory = simulate_trajectory(
+        args.num_samples,
+        noise_std=args.gt_noise_std,  # Pass the ground truth noise standard deviation
+        sharp_turns=args.sharp_turns  # Pass the sharp turns flag
+    )
     # Train without denoising if --no-denoising is provided
     trained_model_no_denoiser, _ = train_flow_matching(
         gt_trajectory,
@@ -345,6 +357,7 @@ def main(args):
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         denoising=not args.denoising_enabled,
+        l2_reg=args.l2_reg,
     )
 
     # Train with denoising (default) unless --no-denoising is provided
@@ -356,6 +369,7 @@ def main(args):
             learning_rate=args.learning_rate,
             denoising=True,
             noise_std=args.noise_std,
+            l2_reg=args.l2_reg,
         )
     else:
         trained_model_with_denoiser, denoiser = None, None
@@ -416,7 +430,7 @@ def main(args):
         generated_trajectory_with_time_no_denoiser,
         grid_size=5,
         grid_extent=0.5,
-        subsample_step=10,
+        subsample_step=2,
         label="Generated Trajectory (No Denoiser)",
         traj_color="red",
         flow_color="orange",
@@ -430,7 +444,7 @@ def main(args):
             denoiser=denoiser,  # Pass the denoiser to include the composite direction
             grid_size=5,
             grid_extent=0.5,
-            subsample_step=10,
+            subsample_step=2,
             label="Generated Trajectory (With Denoiser)",
             traj_color="green",
             flow_color="lightgreen",
