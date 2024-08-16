@@ -29,7 +29,7 @@ def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=Fa
         t_values = np.sort(np.random.uniform(0, 2 * np.pi, num_samples))
     else:
         t_values = np.linspace(0, 2 * np.pi, num_samples)
-    
+
     if sharp_turns:
         # Sharp turns (e.g., square wave pattern)
         x_values = amplitude * np.sign(np.sin(freq * t_values))  # Creates sharp transitions
@@ -38,7 +38,7 @@ def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=Fa
         # Smooth sinusoidal curve
         x_values = t_values
         y_values = amplitude * np.sin(freq * t_values)
-    
+
     trajectory = np.column_stack((x_values, y_values))
 
     # Apply random rotation
@@ -58,9 +58,9 @@ def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=Fa
 
 
 # Neural network to model f_theta(X)
-class FlowModel(nn.Module):
+class MLP(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=64):
-        super(FlowModel, self).__init__()
+        super(MLP, self).__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -71,22 +71,33 @@ class FlowModel(nn.Module):
 
     def forward(self, x):
         return self.network(x)
-
-
-# Denoiser network to predict the noise
-class DenoiserModel(nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=64):
-        super(DenoiserModel, self).__init__()
+    
+class DiffusionMLP(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=64, min_val=-10.0, max_val=5.0):
+        super(DiffusionMLP, self).__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, input_dim),
+            nn.Tanh()  # Bound the output between -1 and 1
         )
+        # max and min of the log of diffusion coefficient g
+        self.min_val = min_val
+        self.max_val = max_val
 
     def forward(self, x):
-        return self.network(x)
+        # Apply the network, bound it, and then exponentiate to ensure positive output
+        bounded_output = self.network(x)
+        
+        # Rescale from [-1, 1] to [min_val, max_val]
+        scaled_output = (bounded_output + 1) * 0.5 * (self.max_val - self.min_val) + self.min_val
+        
+        # Optionally apply exponential if needed for larger dynamic range
+        scaled_output = torch.exp(scaled_output)
+        
+        return scaled_output
 
 
 # Interpolation function
@@ -116,15 +127,51 @@ class FlowMatchingDataset(Dataset):
         dx_dt = (x_end - x_start) / (t_end - t_start)
         dy_dt = (y_end - y_start) / (t_end - t_start)
 
+        delta_t = t_end - t_start  # Dynamically computed delta_t
+        assert delta_t >= 1e-4, "Delta t is too small"
+
         clean_data = torch.tensor([x_interp, y_interp], dtype=torch.float32)
         target_data = torch.tensor([dx_dt, dy_dt], dtype=torch.float32)
+        delta_t_tensor = torch.tensor(
+            delta_t, dtype=torch.float32
+        )  # Return delta_t as a tensor
 
         if self.denoising:
             noise = torch.randn_like(clean_data) * self.noise_std
             noisy_data = clean_data + noise
-            return noisy_data, clean_data, target_data, -noise
+            return noisy_data, clean_data, target_data, -noise, delta_t_tensor
         else:
-            return clean_data, target_data
+            return clean_data, target_data, delta_t_tensor
+
+
+# Update the negative log-likelihood function to accept delta_t dynamically
+def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t):
+    """
+    Compute the negative log-likelihood loss for the SDE with a vector-valued diffusion term.
+
+    Args:
+        f_pred (torch.Tensor): The predicted drift values (f(x)).
+        g_pred (torch.Tensor): The predicted diffusion values (g(x)), assumed to be vector-valued.
+        dx_dt (torch.Tensor): The observed trajectory finite-difference values.
+        delta_t (torch.Tensor): The time step size for each data point.
+
+    Returns:
+        torch.Tensor: The computed negative log-likelihood loss.
+    """
+    # Drift loss term: sum over both components
+    drift_loss = torch.sum(
+        ((dx_dt - f_pred) ** 2 * delta_t.unsqueeze(1)) / (2 * g_pred**2 + 1e-6), dim=1
+    )
+
+    # Normalization term: sum over both components
+    norm_term = torch.sum(
+        0.5 * torch.log(2 * torch.pi * g_pred**2 * delta_t.unsqueeze(1) + 1e-6), dim=1
+    )
+
+    # Final NLL: sum over all data points
+    nll = torch.sum(drift_loss + norm_term)
+
+    return nll
 
 
 def train_flow_matching(
@@ -135,56 +182,67 @@ def train_flow_matching(
     denoising=False,
     noise_std=0.1,
     l2_reg=0.0,
+    diffusion_min=-10.0,
+    diffusion_max=5.0,  # Add these to control the diffusion range
 ):
     dataset = FlowMatchingDataset(trajectory, denoising=denoising, noise_std=noise_std)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    model = FlowModel()
-    denoiser = DenoiserModel() if denoising else None
-    criterion = nn.MSELoss()
+    flow_field = MLP()  # For drift (f_theta)
+    denoiser = MLP() if denoising else None
+    diffusion_field = DiffusionMLP(min_val=diffusion_min, max_val=diffusion_max)  # For diffusion (g_theta)
+
     optimizer = optim.Adam(
-        list(model.parameters()) + (list(denoiser.parameters()) if denoiser else []),
+        list(flow_field.parameters())
+        + (list(denoiser.parameters()) if denoiser else [])
+        + list(diffusion_field.parameters()),
         lr=learning_rate,
-        weight_decay=l2_reg  # Add L2 regularization here
+        weight_decay=l2_reg,
     )
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         for batch in dataloader:
+            optimizer.zero_grad()
+
             if denoising:
-                noisy_data, clean_data, target_data, noise_target = batch
-                optimizer.zero_grad()
-                f_theta = model(noisy_data)
-                denoise_pred = denoiser(noisy_data)
-                loss = criterion(f_theta, target_data) + criterion(
-                    denoise_pred, noise_target
-                )
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
+                noisy_data, clean_data, target_data, noise_target, delta_t = batch
             else:
-                clean_data, target_data = batch
-                optimizer.zero_grad()
-                f_theta = model(clean_data)
-                loss = criterion(f_theta, target_data)
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
+                clean_data, target_data, delta_t = batch
+
+            # Predict drift (f_theta)
+            f_theta = flow_field(clean_data if not denoising else noisy_data)
+            # Predict diffusion (g_theta) with bounded positive output
+            g_theta = diffusion_field(clean_data if not denoising else noisy_data)
+
+            # Compute MLE-based negative log-likelihood loss
+            loss = negative_log_likelihood(f_theta, g_theta, target_data, delta_t)
+
+            # If denoising, add the denoising loss
+            if denoising:
+                denoise_pred = denoiser(noisy_data)
+                denoise_loss = nn.MSELoss()(denoise_pred, noise_target)
+                loss += denoise_loss
+
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
 
         if (epoch + 1) % 10 == 0:
             print(
                 f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss / len(dataloader):.4f}"
             )
 
-    return model, denoiser
+    return flow_field, denoiser, diffusion_field
 
 
 class FlowSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
-    def __init__(self, model, denoiser=None, noise_std=0.1):
+
+    def __init__(self, model, diffusion_model, denoiser=None):
         super().__init__(noise_type="diagonal")  # Removed `sde_type`
-        self.model = model
+        self.model = model  # The drift model
+        self.diffusion_model = diffusion_model  # The learned diffusion model
         self.denoiser = denoiser
-        self.noise_std = noise_std
 
     # Drift term: f + denoising
     def f(self, t, X):
@@ -195,21 +253,23 @@ class FlowSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
                 flow += denoising
             return flow
 
-    # Diffusion term: σ
+    # Diffusion term: g(X)
     def g(self, t, X):
-        # Add isotropic noise (diagonal with constant standard deviation)
-        return self.noise_std * torch.ones_like(X)
+        with torch.no_grad():
+            diffusion = self.diffusion_model(X)
+            print(diffusion)
+            return diffusion  # Return the learned diffusion coefficients
 
 
 def generate_trajectory(
     model,
+    diffusion_model,  # Added diffusion model as a parameter
     initial_point,
     t_values,
     denoiser=None,
     rtol=1e-1,
     atol=1e-2,
     use_sde=False,
-    sde_noise_std=0.1,
 ):
     global call_count
     call_count = 0  # Reset the counter at the beginning of each integration
@@ -225,7 +285,7 @@ def generate_trajectory(
             dx_dt += denoise_correction
         return dx_dt
 
-    # SDE version: Wrap the model to count function calls
+    # SDE version: Wrap the model and diffusion model to count function calls
     class CountingFlowSDE(FlowSDE):
         def f(self, t, X):
             global call_count
@@ -234,7 +294,7 @@ def generate_trajectory(
 
     if use_sde:
         # Use SDE solver with call counting
-        sde_model = CountingFlowSDE(model, denoiser=denoiser, noise_std=sde_noise_std)
+        sde_model = CountingFlowSDE(model, diffusion_model, denoiser=denoiser)
         initial_point_tensor = torch.tensor(
             initial_point, dtype=torch.float32
         ).unsqueeze(0)
@@ -245,7 +305,7 @@ def generate_trajectory(
                     sde_model,
                     initial_point_tensor,
                     ts,
-                    method="milstein",  # 'srk' stochastic runge-kutta, 'euler' euler-maruyama, 'milstein' milstein
+                    method="milstein",  # 'srk', 'euler', 'milstein', etc.
                     adaptive=True,
                     rtol=rtol,
                     atol=atol,
@@ -380,24 +440,24 @@ def parse_args():
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=100,
+        default=30,
         help="Number of samples in the trajectory",
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=100, help="Number of epochs for training"
+        "--num_epochs", type=int, default=1000, help="Number of epochs for training"
     )
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for training')
     parser.add_argument(
         "--noise_std",
         type=float,
-        default=0.15,
+        default=0.2,
         help="Standard deviation of Gaussian noise added for denoising",
     )
     parser.add_argument(
         "--gt_noise_std",
         type=float,
-        default=0.0,
+        default=0.01,
         help="Standard deviation of Gaussian noise added to the ground truth trajectory",
     )
     parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance for solve_ivp')
@@ -407,17 +467,11 @@ def parse_args():
     parser.add_argument(
         "--l2_reg",
         type=float,
-        default=0.0,
+        default=0.01,
         help="L2 regularization strength (weight decay)",
     )
     parser.add_argument(
         "--use_sde", action="store_true", help="Use SDE instead of ODE for inference"
-    )
-    parser.add_argument(
-        "--sde_noise_std",
-        type=float,
-        default=0.025,
-        help="Standard deviation of the Wiener process in SDE",
     )
 
     args = parser.parse_args()
@@ -433,7 +487,7 @@ def main(args):
     )
 
     # Train without denoising if --no-denoising is provided
-    trained_model_no_denoiser, _ = train_flow_matching(
+    trained_model_no_denoiser, _, diffusion_model_no_denoiser = train_flow_matching(
         gt_trajectory,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
@@ -444,17 +498,23 @@ def main(args):
 
     # Train with denoising (default) unless --no-denoising is provided
     if args.denoising_enabled:
-        trained_model_with_denoiser, denoiser = train_flow_matching(
-            gt_trajectory,
-            num_epochs=args.num_epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            denoising=True,
-            noise_std=args.noise_std,
-            l2_reg=args.l2_reg,  # Pass the L2 regularization strength
+        trained_model_with_denoiser, denoiser, diffusion_model_with_denoiser = (
+            train_flow_matching(
+                gt_trajectory,
+                num_epochs=args.num_epochs,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                denoising=True,
+                noise_std=args.noise_std,
+                l2_reg=args.l2_reg,  # Pass the L2 regularization strength
+            )
         )
     else:
-        trained_model_with_denoiser, denoiser = None, None
+        trained_model_with_denoiser, denoiser, diffusion_model_with_denoiser = (
+            None,
+            None,
+            None,
+        )
 
     # Generate trajectories
     t_values = gt_trajectory[:, 0]
@@ -463,26 +523,26 @@ def main(args):
     # Without denoiser
     generated_trajectory_no_denoiser = generate_trajectory(
         trained_model_no_denoiser,
+        diffusion_model_no_denoiser,  # Add diffusion model
         initial_point,
         t_values,
         denoiser=None,
         rtol=args.rtol,
         atol=args.atol,
         use_sde=args.use_sde,
-        sde_noise_std=args.sde_noise_std,
     )
 
     # With denoiser (if enabled)
     if args.denoising_enabled:
         generated_trajectory_with_denoiser = generate_trajectory(
             trained_model_with_denoiser,
+            diffusion_model_with_denoiser,  # Add diffusion model
             initial_point,
             t_values,
             denoiser=denoiser,
             rtol=args.rtol,
             atol=args.atol,
             use_sde=args.use_sde,
-            sde_noise_std=args.sde_noise_std,
         )
         generated_trajectory_with_time_denoiser = np.column_stack(
             (t_values, generated_trajectory_with_denoiser)
@@ -523,7 +583,6 @@ def main(args):
     )
 
     # Plot Generated Trajectory with Denoiser (if enabled)
-
     if args.denoising_enabled:
         visualize_flow_field_around_trajectory(
             trained_model_with_denoiser,
