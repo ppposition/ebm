@@ -10,51 +10,80 @@ from scipy.integrate import solve_ivp
 
 
 # Simulate the trajectory
-def simulate_trajectory(num_samples, amplitude=1.0, freq=1.0, random_sampling=False, noise_std=0.0, sharp_turns=False):
+# Simulate the trajectory
+def simulate_trajectory(
+    num_trajectories,
+    num_samples,
+    amplitude=1.0,
+    freq=1.0,
+    random_sampling=False,
+    noise_std=0.0,
+    sharp_turns=False,
+    branching=False
+):
     """
-    Simulate a 2D trajectory, optionally with sharp turns and noise.
+    Simulate one or more 2D trajectories, optionally with branching and noise.
 
     Args:
-        num_samples (int): Number of samples in the trajectory.
+        num_trajectories (int): Number of trajectories.
+        num_samples (int): Number of samples in each trajectory.
         amplitude (float): Amplitude of the trajectory.
         freq (float): Frequency of the trajectory (for sinusoidal curves).
         random_sampling (bool): Whether to use random sampling for time steps.
         noise_std (float): Standard deviation of Gaussian noise added to the trajectory.
         sharp_turns (bool): Whether to add sharp turns to the trajectory.
+        branching (bool): Whether to branch the trajectory into two directions.
 
     Returns:
-        np.ndarray: The trajectory with time indices.
+        list of np.ndarray: List of trajectories with time indices.
     """
-    if random_sampling:
-        t_values = np.sort(np.random.uniform(0, 2 * np.pi, num_samples))
-    else:
-        t_values = np.linspace(0, 2 * np.pi, num_samples)
+    trajectories = []
 
-    if sharp_turns:
-        # Sharp turns (e.g., square wave pattern)
-        x_values = amplitude * np.sign(np.sin(freq * t_values))  # Creates sharp transitions
-        y_values = amplitude * np.sign(np.cos(freq * t_values))
-    else:
-        # Smooth sinusoidal curve
-        x_values = t_values
-        y_values = amplitude * np.sin(freq * t_values)
+    for _ in range(num_trajectories):
+        if random_sampling:
+            t_values = np.sort(np.random.uniform(0, 2 * np.pi, num_samples))
+        else:
+            t_values = np.linspace(0, 2 * np.pi, num_samples)
 
-    trajectory = np.column_stack((x_values, y_values))
+        if branching:
+            # Create a smooth line that branches into two directions at the halfway point
+            x_values = t_values
+            y_values = np.zeros_like(t_values)
 
-    # Apply random rotation
-    rotation_matrix = np.random.randn(2, 2)
-    q, _ = np.linalg.qr(rotation_matrix)
-    rotated_trajectory = np.dot(trajectory, q)
+            # Create branching
+            branch_point = num_samples // 2
 
-    # Add continuous time variable to the trajectory
-    final_trajectory = np.column_stack((t_values, rotated_trajectory))
+            # Line before branching (y = 0)
+            y_values[:branch_point] = 0
 
-    # Add synthetic Gaussian noise if noise_std > 0
-    if noise_std > 0:
-        noise = np.random.normal(0, noise_std, final_trajectory[:, 1:].shape)
-        final_trajectory[:, 1:] += noise
+            # Create two separate branches after the branch point
+            # Using a smooth transition instead of linear interpolation
+            smooth_transition = np.sin(np.linspace(0, np.pi, num_samples - branch_point))
+            y_branch_1 = amplitude * smooth_transition  # First branch
+            y_branch_2 = -amplitude * smooth_transition  # Second branch
 
-    return final_trajectory
+            # Construct the trajectories
+            trajectory_1 = np.column_stack((t_values[:branch_point], x_values[:branch_point], y_values[:branch_point]))
+            trajectory_2_1 = np.column_stack((t_values[branch_point:], x_values[branch_point:], y_branch_1))
+            trajectory_2_2 = np.column_stack((t_values[branch_point:], x_values[branch_point:], y_branch_2))
+
+            # Append both branches to the list of trajectories
+            trajectories.append(np.vstack((trajectory_1, trajectory_2_1)))
+            trajectories.append(np.vstack((trajectory_1, trajectory_2_2)))
+        else:
+            # Simple straight line trajectory
+            x_values = t_values
+            y_values = amplitude * np.sin(freq * t_values)
+            trajectory = np.column_stack((t_values, x_values, y_values))
+            trajectories.append(trajectory)
+
+        # Add synthetic Gaussian noise if noise_std > 0
+        if noise_std > 0:
+            for trajectory in trajectories:
+                noise = np.random.normal(0, noise_std, trajectory[:, 1:].shape)
+                trajectory[:, 1:] += noise
+
+    return trajectories
 
 
 # Neural network to model f_theta(X)
@@ -108,17 +137,30 @@ def interpolate_position(time, time_start, time_end, pos_start, pos_end):
 
 
 class FlowMatchingDataset(Dataset):
-    def __init__(self, trajectory, denoising=False, noise_std=0.1):
-        self.trajectory = trajectory
+    def __init__(self, trajectories, denoising=False, noise_std=0.1):
+        """
+        Args:
+            trajectories (list of np.ndarray): List of 2D trajectories, each with shape (num_samples, 3).
+            denoising (bool): Whether to apply denoising to the input data.
+            noise_std (float): Standard deviation of noise for denoising.
+        """
+        self.trajectories = trajectories  # List of trajectories
         self.denoising = denoising
         self.noise_std = noise_std
+        self.data = []  # Flattened list of all trajectory segments
+
+        # Flatten the trajectories into a single dataset
+        for trajectory in trajectories:
+            for idx in range(len(trajectory) - 1):
+                self.data.append((trajectory[idx], trajectory[idx + 1]))
 
     def __len__(self):
-        return len(self.trajectory) - 1
+        return len(self.data)
 
     def __getitem__(self, idx):
-        t_start, x_start, y_start = self.trajectory[idx]
-        t_end, x_end, y_end = self.trajectory[idx + 1]
+        start_point, end_point = self.data[idx]  # Correct unpacking
+        t_start, x_start, y_start = start_point
+        t_end, x_end, y_end = end_point
 
         t_rand = np.random.uniform(t_start, t_end)
         x_interp = interpolate_position(t_rand, t_start, t_end, x_start, x_end)
@@ -128,13 +170,11 @@ class FlowMatchingDataset(Dataset):
         dy_dt = (y_end - y_start) / (t_end - t_start)
 
         delta_t = t_end - t_start  # Dynamically computed delta_t
-        assert delta_t >= 1e-4, "Delta t is too small"
+        assert delta_t >= 1e-4, f"Delta t is too small: {delta_t}"
 
         clean_data = torch.tensor([x_interp, y_interp], dtype=torch.float32)
         target_data = torch.tensor([dx_dt, dy_dt], dtype=torch.float32)
-        delta_t_tensor = torch.tensor(
-            delta_t, dtype=torch.float32
-        )  # Return delta_t as a tensor
+        delta_t_tensor = torch.tensor(delta_t, dtype=torch.float32)  # Return delta_t as a tensor
 
         if self.denoising:
             noise = torch.randn_like(clean_data) * self.noise_std
@@ -145,7 +185,7 @@ class FlowMatchingDataset(Dataset):
 
 
 # Update the negative log-likelihood function to accept delta_t dynamically
-def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t):
+def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t, train_diffusion=True):
     """
     Compute the negative log-likelihood loss for the SDE with a vector-valued diffusion term.
 
@@ -154,6 +194,7 @@ def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t):
         g_pred (torch.Tensor): The predicted diffusion values (g(x)), assumed to be vector-valued.
         dx_dt (torch.Tensor): The observed trajectory finite-difference values.
         delta_t (torch.Tensor): The time step size for each data point.
+        train_diffusion (bool): Whether the diffusion term is being trained.
 
     Returns:
         torch.Tensor: The computed negative log-likelihood loss.
@@ -163,19 +204,21 @@ def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t):
         ((dx_dt - f_pred) ** 2 * delta_t.unsqueeze(1)) / (2 * g_pred**2 + 1e-6), dim=1
     )
 
-    # Normalization term: sum over both components
-    norm_term = torch.sum(
-        0.5 * torch.log(2 * torch.pi * g_pred**2 * delta_t.unsqueeze(1) + 1e-6), dim=1
-    )
-
-    # Final NLL: sum over all data points
-    nll = torch.sum(drift_loss + norm_term)
+    # Only include the normalization term if training diffusion
+    if train_diffusion:
+        norm_term = torch.sum(
+            0.5 * torch.log(2 * torch.pi * g_pred**2 * delta_t.unsqueeze(1) + 1e-6), dim=1
+        )
+        nll = torch.sum(drift_loss + norm_term)
+    else:
+        # If not training diffusion, only use the drift loss term
+        nll = torch.sum(drift_loss)
 
     return nll
 
 
 def train_flow_matching(
-    trajectory,
+    trajectories,  # Now this accepts a list of trajectories directly
     num_epochs=100,
     batch_size=32,
     learning_rate=0.001,
@@ -183,19 +226,23 @@ def train_flow_matching(
     noise_std=0.1,
     l2_reg=0.0,
     diffusion_min=-10.0,
-    diffusion_max=5.0,  # Add these to control the diffusion range
+    diffusion_max=5.0,  # Control the diffusion range
+    train_diffusion=True  # Added flag to control diffusion training
 ):
-    dataset = FlowMatchingDataset(trajectory, denoising=denoising, noise_std=noise_std)
+    # Pass the list of trajectories directly to the dataset
+    dataset = FlowMatchingDataset(trajectories, denoising=denoising, noise_std=noise_std)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    # Initialize models
     flow_field = MLP()  # For drift (f_theta)
     denoiser = MLP() if denoising else None
     diffusion_field = DiffusionMLP(min_val=diffusion_min, max_val=diffusion_max)  # For diffusion (g_theta)
 
+    # Set up optimizer
     optimizer = optim.Adam(
         list(flow_field.parameters())
         + (list(denoiser.parameters()) if denoiser else [])
-        + list(diffusion_field.parameters()),
+        + (list(diffusion_field.parameters()) if train_diffusion else []),  # Only optimize diffusion if enabled
         lr=learning_rate,
         weight_decay=l2_reg,
     )
@@ -212,11 +259,16 @@ def train_flow_matching(
 
             # Predict drift (f_theta)
             f_theta = flow_field(clean_data if not denoising else noisy_data)
-            # Predict diffusion (g_theta) with bounded positive output
-            g_theta = diffusion_field(clean_data if not denoising else noisy_data)
+
+            if train_diffusion:
+                # Predict diffusion (g_theta) with bounded positive output
+                g_theta = diffusion_field(clean_data if not denoising else noisy_data)
+            else:
+                # Set diffusion to a fixed constant value, e.g., 1.0
+                g_theta = torch.ones_like(f_theta)
 
             # Compute MLE-based negative log-likelihood loss
-            loss = negative_log_likelihood(f_theta, g_theta, target_data, delta_t)
+            loss = negative_log_likelihood(f_theta, g_theta, target_data, delta_t, train_diffusion=train_diffusion)
 
             # If denoising, add the denoising loss
             if denoising:
@@ -229,27 +281,26 @@ def train_flow_matching(
             epoch_loss += loss.item()
 
         if (epoch + 1) % 10 == 0:
-            print(
-                f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss / len(dataloader):.4f}"
-            )
+            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss / len(dataloader):.4f}")
 
     return flow_field, denoiser, diffusion_field
 
 
 class FlowSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
 
-    def __init__(self, model, diffusion_model, denoiser=None):
-        super().__init__(noise_type="diagonal")  # Removed `sde_type`
+    def __init__(self, model, diffusion_model, denoiser=None, denoising_magnitude=1.0):
+        super().__init__(noise_type="diagonal")
         self.model = model  # The drift model
         self.diffusion_model = diffusion_model  # The learned diffusion model
         self.denoiser = denoiser
+        self.denoising_magnitude = denoising_magnitude  # Scaling factor for denoising
 
-    # Drift term: f + denoising
+    # Drift term: f + c * denoising
     def f(self, t, X):
         with torch.no_grad():
             flow = self.model(X)
             if self.denoiser:
-                denoising = self.denoiser(X)
+                denoising = self.denoiser(X) * self.denoising_magnitude
                 flow += denoising
             return flow
 
@@ -257,7 +308,6 @@ class FlowSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
     def g(self, t, X):
         with torch.no_grad():
             diffusion = self.diffusion_model(X)
-            print(diffusion)
             return diffusion  # Return the learned diffusion coefficients
 
 
@@ -270,6 +320,7 @@ def generate_trajectory(
     rtol=1e-1,
     atol=1e-2,
     use_sde=False,
+    denoising_magnitude=1.0  # Add denoising magnitude
 ):
     global call_count
     call_count = 0  # Reset the counter at the beginning of each integration
@@ -281,12 +332,15 @@ def generate_trajectory(
         X_tensor = torch.tensor(X, dtype=torch.float32)
         dx_dt = model(X_tensor).detach().numpy()
         if denoiser:
-            denoise_correction = denoiser(X_tensor).detach().numpy()
+            denoise_correction = denoiser(X_tensor).detach().numpy() * denoising_magnitude
             dx_dt += denoise_correction
         return dx_dt
 
     # SDE version: Wrap the model and diffusion model to count function calls
     class CountingFlowSDE(FlowSDE):
+        def __init__(self, model, diffusion_model, denoiser=None, denoising_magnitude=1.0):
+            super().__init__(model, diffusion_model, denoiser, denoising_magnitude)
+
         def f(self, t, X):
             global call_count
             call_count += 1
@@ -294,10 +348,8 @@ def generate_trajectory(
 
     if use_sde:
         # Use SDE solver with call counting
-        sde_model = CountingFlowSDE(model, diffusion_model, denoiser=denoiser)
-        initial_point_tensor = torch.tensor(
-            initial_point, dtype=torch.float32
-        ).unsqueeze(0)
+        sde_model = CountingFlowSDE(model, diffusion_model, denoiser=denoiser, denoising_magnitude=denoising_magnitude)
+        initial_point_tensor = torch.tensor(initial_point, dtype=torch.float32).unsqueeze(0)
         ts = torch.tensor(t_values, dtype=torch.float32)
         with torch.no_grad():
             trajectory = (
@@ -363,6 +415,7 @@ def visualize_flow_field_around_trajectory(
     label="Trajectory",
     traj_color="blue",
     flow_color="red",
+    denoising_magnitude=1.0,
 ):
     t_values = trajectory[:, 0]
     x_values = trajectory[:, 1]
@@ -393,7 +446,7 @@ def visualize_flow_field_around_trajectory(
                 
                 # Add the denoising direction if denoiser is provided
                 if denoiser:
-                    denoise_correction = denoiser(X_tensor).detach().numpy()
+                    denoise_correction = denoising_magnitude * denoiser(X_tensor).detach().numpy()
                     flow += denoise_correction  # Composite direction
                 
                 plt.arrow(
@@ -440,7 +493,7 @@ def parse_args():
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=30,
+        default=50,
         help="Number of samples in the trajectory",
     )
     parser.add_argument(
@@ -451,13 +504,13 @@ def parse_args():
     parser.add_argument(
         "--noise_std",
         type=float,
-        default=0.2,
+        default=0.1,
         help="Standard deviation of Gaussian noise added for denoising",
     )
     parser.add_argument(
         "--gt_noise_std",
         type=float,
-        default=0.01,
+        default=0.005,
         help="Standard deviation of Gaussian noise added to the ground truth trajectory",
     )
     parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance for solve_ivp')
@@ -467,28 +520,36 @@ def parse_args():
     parser.add_argument(
         "--l2_reg",
         type=float,
-        default=0.01,
+        default=0.001,
         help="L2 regularization strength (weight decay)",
     )
     parser.add_argument(
         "--use_sde", action="store_true", help="Use SDE instead of ODE for inference"
     )
-
+    parser.add_argument('--branching', action='store_true', help='Enable branching in the trajectory')
+    parser.add_argument(
+        '--denoising_magnitude',
+        type=float,
+        default=2.5,
+        help='Scale factor for the denoising correction during inference'
+    )
     args = parser.parse_args()
     return args
 
 
 def main(args):
     # Simulate the trajectory with optional sharp turns and noise
-    gt_trajectory = simulate_trajectory(
+    gt_trajectories = simulate_trajectory(
+        1,
         args.num_samples,
-        noise_std=args.gt_noise_std,  # Pass the ground truth noise standard deviation
-        sharp_turns=args.sharp_turns  # Pass the sharp turns flag
+        noise_std=args.gt_noise_std,
+        sharp_turns=args.sharp_turns,
+        branching=args.branching  # Pass the branching flag
     )
 
     # Train without denoising if --no-denoising is provided
     trained_model_no_denoiser, _, diffusion_model_no_denoiser = train_flow_matching(
-        gt_trajectory,
+        gt_trajectories,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -500,7 +561,7 @@ def main(args):
     if args.denoising_enabled:
         trained_model_with_denoiser, denoiser, diffusion_model_with_denoiser = (
             train_flow_matching(
-                gt_trajectory,
+                gt_trajectories,
                 num_epochs=args.num_epochs,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
@@ -517,8 +578,8 @@ def main(args):
         )
 
     # Generate trajectories
-    t_values = gt_trajectory[:, 0]
-    initial_point = gt_trajectory[0, 1:]  # Starting point (x, y)
+    t_values = gt_trajectories[0][:, 0]
+    initial_point = gt_trajectories[0][0, 1:]  # Starting point (x, y)
 
     # Without denoiser
     generated_trajectory_no_denoiser = generate_trajectory(
@@ -530,50 +591,32 @@ def main(args):
         rtol=args.rtol,
         atol=args.atol,
         use_sde=args.use_sde,
+        denoising_magnitude=args.denoising_magnitude,
     )
 
-    # With denoiser (if enabled)
-    if args.denoising_enabled:
-        generated_trajectory_with_denoiser = generate_trajectory(
-            trained_model_with_denoiser,
-            diffusion_model_with_denoiser,  # Add diffusion model
-            initial_point,
-            t_values,
-            denoiser=denoiser,
-            rtol=args.rtol,
-            atol=args.atol,
-            use_sde=args.use_sde,
-        )
-        generated_trajectory_with_time_denoiser = np.column_stack(
-            (t_values, generated_trajectory_with_denoiser)
-        )
-    else:
-        generated_trajectory_with_time_denoiser = None
-
-    # Add time to the generated trajectory without denoiser
-    generated_trajectory_with_time_no_denoiser = np.column_stack(
-        (t_values, generated_trajectory_no_denoiser)
-    )
+    # Ensure the trajectory has the time dimension (t, x, y)
+    generated_trajectory_no_denoiser = np.column_stack((t_values, generated_trajectory_no_denoiser))
 
     # Create a single plot
     plt.figure(figsize=(10, 8))
 
     # Plot Ground Truth Trajectory
-    visualize_flow_field_around_trajectory(
-        trained_model_no_denoiser,
-        gt_trajectory,
-        grid_size=5,
-        grid_extent=0.5,
-        subsample_step=5,
-        label="Ground Truth Trajectory",
-        traj_color="blue",
-        flow_color="lightblue",
-    )
+    for traj in gt_trajectories:
+        visualize_flow_field_around_trajectory(
+            trained_model_no_denoiser,
+            traj,  # Use the first trajectory for visualization
+            grid_size=5,
+            grid_extent=0.5,
+            subsample_step=5,
+            label="Ground Truth Trajectory",
+            traj_color="blue",
+            flow_color="lightblue",
+        )
 
     # Plot Generated Trajectory without Denoiser
     visualize_flow_field_around_trajectory(
         trained_model_no_denoiser,
-        generated_trajectory_with_time_no_denoiser,
+        generated_trajectory_no_denoiser,
         grid_size=5,
         grid_extent=0.5,
         subsample_step=5,
@@ -582,19 +625,36 @@ def main(args):
         flow_color="orange",
     )
 
-    # Plot Generated Trajectory with Denoiser (if enabled)
+    # Plot multiple Generated Trajectories with Denoiser (if enabled)
     if args.denoising_enabled:
-        visualize_flow_field_around_trajectory(
-            trained_model_with_denoiser,
-            generated_trajectory_with_time_denoiser,
-            denoiser=denoiser,
-            grid_size=5,
-            grid_extent=0.5,
-            subsample_step=5,
-            label="Generated Trajectory (With Denoiser)",
-            traj_color="green",
-            flow_color="lightgreen",
-        )
+        for i in range(5):  # Generate and plot 10 trajectories
+            generated_trajectory_with_denoiser = generate_trajectory(
+                trained_model_with_denoiser,
+                diffusion_model_with_denoiser,  # Add diffusion model
+                initial_point,
+                t_values,
+                denoiser=denoiser,
+                rtol=args.rtol,
+                atol=args.atol,
+                use_sde=args.use_sde,
+                denoising_magnitude=args.denoising_magnitude,
+            )
+            # Concatenate the time values to create (t, x, y) format
+            generated_trajectory_with_denoiser = np.column_stack(
+                (t_values, generated_trajectory_with_denoiser)
+            )
+            visualize_flow_field_around_trajectory(
+                trained_model_with_denoiser,
+                generated_trajectory_with_denoiser,
+                denoiser=denoiser,
+                grid_size=5,
+                grid_extent=0.5,
+                subsample_step=5,
+                label=f"Generated Trajectory {i + 1} (With Denoiser)",
+                traj_color="green",
+                flow_color="lightgreen",
+                denoising_magnitude=args.denoising_magnitude,
+            )
 
     plt.xlabel("X")
     plt.ylabel("Y")
