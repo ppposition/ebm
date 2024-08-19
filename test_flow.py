@@ -6,10 +6,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import torchsde
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from scipy.integrate import solve_ivp
 
 
-# Simulate the trajectory
 # Simulate the trajectory
 def simulate_trajectory(
     num_trajectories,
@@ -100,7 +100,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.network(x)
-    
+
 class DiffusionMLP(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=64, min_val=-10.0, max_val=5.0):
         super(DiffusionMLP, self).__init__()
@@ -184,41 +184,89 @@ class FlowMatchingDataset(Dataset):
             return clean_data, target_data, delta_t_tensor
 
 
-# Update the negative log-likelihood function to accept delta_t dynamically
-def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t, train_diffusion=True):
+# # Update the negative log-likelihood function to accept delta_t dynamically
+# def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t, train_diffusion=True):
+#     """
+#     Compute the negative log-likelihood loss for the SDE with a vector-valued diffusion term.
+
+#     Args:
+#         f_pred (torch.Tensor): The predicted drift values (f(x)).
+#         g_pred (torch.Tensor): The predicted diffusion values (g(x)), assumed to be vector-valued.
+#         dx_dt (torch.Tensor): The observed trajectory finite-difference values.
+#         delta_t (torch.Tensor): The time step size for each data point.
+#         train_diffusion (bool): Whether the diffusion term is being trained.
+
+#     Returns:
+#         torch.Tensor: The computed negative log-likelihood loss.
+#     """
+#     # Drift loss term: sum over both components
+#     drift_loss = torch.sum(
+#         ((dx_dt - f_pred) ** 2 * delta_t.unsqueeze(1)) / (2 * g_pred**2 + 1e-6), dim=1
+#     )
+
+#     # Only include the normalization term if training diffusion
+#     if train_diffusion:
+#         norm_term = torch.sum(
+#             0.5 * torch.log(2 * torch.pi * g_pred**2 * delta_t.unsqueeze(1) + 1e-6), dim=1
+#         )
+#         nll = torch.sum(drift_loss + norm_term)
+#     else:
+#         # If not training diffusion, only use the drift loss term
+#         nll = torch.sum(drift_loss)
+
+#     return nll
+
+
+# Updated negative log-likelihood function for the improved training strategy
+def improved_negative_log_likelihood(f_pred, dx_dt):
     """
-    Compute the negative log-likelihood loss for the SDE with a vector-valued diffusion term.
+    Compute the log-squared error objective for training the flow network.
+
+    This loss function is derived from the original negative log-likelihood (NLL) of a
+    Stochastic Differential Equation (SDE) model, where the drift function (f_pred)
+    and the diffusion function (g_pred) are trained together.
+
+    Derivation:
+    1. The original NLL can be expressed as:
+       NLL = sum(((dx/dt - f_pred) ** 2 / (2 * g_pred ** 2) + 0.5 * log(2 * pi * g_pred ** 2)) * delta_t)
+
+    2. By analytically minimizing the NLL with respect to g_pred, we find that the
+       optimal g_pred is given by:
+       g_pred ** 2 = (dx/dt - f_pred) ** 2 * delta_t
+
+    3. Substituting this optimal g_pred back into the NLL and removing constant terms,
+       the resulting objective simplifies to:
+       J(f_pred) = log((dx/dt - f_pred) ** 2)
+
+    This new objective focuses solely on minimizing the difference between the observed
+    trajectory (dx/dt) and the predicted drift (f_pred), without explicitly training the
+    diffusion term. The log term helps in reducing the impact of large errors, promoting
+    smoother convergence.
 
     Args:
         f_pred (torch.Tensor): The predicted drift values (f(x)).
-        g_pred (torch.Tensor): The predicted diffusion values (g(x)), assumed to be vector-valued.
         dx_dt (torch.Tensor): The observed trajectory finite-difference values.
-        delta_t (torch.Tensor): The time step size for each data point.
-        train_diffusion (bool): Whether the diffusion term is being trained.
 
     Returns:
-        torch.Tensor: The computed negative log-likelihood loss.
+        torch.Tensor: The computed log-squared error loss for training the flow network.
     """
-    # Drift loss term: sum over both components
-    drift_loss = torch.sum(
-        ((dx_dt - f_pred) ** 2 * delta_t.unsqueeze(1)) / (2 * g_pred**2 + 1e-6), dim=1
-    )
+    log_sq_error = torch.log(torch.sum(torch.square(dx_dt - f_pred), dim=1) + 1e-6)
+    return torch.sum(log_sq_error)
 
-    # Only include the normalization term if training diffusion
-    if train_diffusion:
-        norm_term = torch.sum(
-            0.5 * torch.log(2 * torch.pi * g_pred**2 * delta_t.unsqueeze(1) + 1e-6), dim=1
-        )
-        nll = torch.sum(drift_loss + norm_term)
-    else:
-        # If not training diffusion, only use the drift loss term
-        nll = torch.sum(drift_loss)
 
-    return nll
+def diffusion_regression_loss(g_pred, f_pred, dx_dt, delta_t):
+    """
+    Compute the regression loss for the diffusion network.
+    g_pred^2 should match (dx/dt - f)^2 * delta_t
+    """
+    # Detach f_pred to prevent backpropagation through f_theta
+    target_g_sq = (dx_dt - f_pred.detach()) ** 2 * delta_t.unsqueeze(1)
+    g_sq = g_pred**2
+    return torch.sum(torch.square(g_sq - target_g_sq))
 
 
 def train_flow_matching(
-    trajectories,  # Now this accepts a list of trajectories directly
+    trajectories,
     num_epochs=100,
     batch_size=32,
     learning_rate=0.001,
@@ -226,31 +274,46 @@ def train_flow_matching(
     noise_std=0.1,
     l2_reg=0.0,
     diffusion_min=-10.0,
-    diffusion_max=5.0,  # Control the diffusion range
-    train_diffusion=True  # Added flag to control diffusion training
+    diffusion_max=0.0,
+    initial_epochs_for_flow_only=100,  # Number of epochs to train flow only
 ):
-    # Pass the list of trajectories directly to the dataset
     dataset = FlowMatchingDataset(trajectories, denoising=denoising, noise_std=noise_std)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # Initialize models
     flow_field = MLP()  # For drift (f_theta)
     denoiser = MLP() if denoising else None
     diffusion_field = DiffusionMLP(min_val=diffusion_min, max_val=diffusion_max)  # For diffusion (g_theta)
 
-    # Set up optimizer
-    optimizer = optim.Adam(
-        list(flow_field.parameters())
-        + (list(denoiser.parameters()) if denoiser else [])
-        + (list(diffusion_field.parameters()) if train_diffusion else []),  # Only optimize diffusion if enabled
+    # Separate optimizers for flow, denoising, and diffusion
+    optimizer_flow = optim.Adam(
+        flow_field.parameters(),
+        lr=learning_rate,
+        weight_decay=l2_reg,
+    )
+    
+    optimizer_denoiser = optim.Adam(
+        denoiser.parameters(),
+        lr=learning_rate,
+        weight_decay=l2_reg,
+    ) if denoiser else None
+    
+    optimizer_diffusion = optim.Adam(
+        diffusion_field.parameters(),
         lr=learning_rate,
         weight_decay=l2_reg,
     )
 
     for epoch in range(num_epochs):
-        epoch_loss = 0.0
+        epoch_loss_flow = 0.0
+        epoch_loss_diffusion = 0.0
+        epoch_loss_denoising = 0.0
+
         for batch in dataloader:
-            optimizer.zero_grad()
+            optimizer_flow.zero_grad()
+            if epoch >= initial_epochs_for_flow_only:
+                optimizer_diffusion.zero_grad()
+            if optimizer_denoiser:
+                optimizer_denoiser.zero_grad()
 
             if denoising:
                 noisy_data, clean_data, target_data, noise_target, delta_t = batch
@@ -260,28 +323,34 @@ def train_flow_matching(
             # Predict drift (f_theta)
             f_theta = flow_field(clean_data if not denoising else noisy_data)
 
-            if train_diffusion:
-                # Predict diffusion (g_theta) with bounded positive output
+            if epoch >= initial_epochs_for_flow_only:
+                # Predict diffusion (g_theta) with bounded positive output, after initial flow training
                 g_theta = diffusion_field(clean_data if not denoising else noisy_data)
-            else:
-                # Set diffusion to a fixed constant value, e.g., 1.0
-                g_theta = torch.ones_like(f_theta)
+                # Compute regression loss for diffusion
+                diffusion_loss = diffusion_regression_loss(g_theta, f_theta, target_data, delta_t)
+                diffusion_loss.backward()
+                epoch_loss_diffusion += diffusion_loss.item()
+                optimizer_diffusion.step()
 
-            # Compute MLE-based negative log-likelihood loss
-            loss = negative_log_likelihood(f_theta, g_theta, target_data, delta_t, train_diffusion=train_diffusion)
+            # Compute improved negative log-likelihood loss for flow
+            flow_loss = improved_negative_log_likelihood(f_theta, target_data)
+            flow_loss.backward()
+            epoch_loss_flow += flow_loss.item()
+            optimizer_flow.step()
 
-            # If denoising, add the denoising loss
+            # Compute denoising loss if applicable
             if denoising:
                 denoise_pred = denoiser(noisy_data)
                 denoise_loss = nn.MSELoss()(denoise_pred, noise_target)
-                loss += denoise_loss
-
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
+                denoise_loss.backward()
+                epoch_loss_denoising += denoise_loss.item()
+                optimizer_denoiser.step()  # Separate step for denoiser
 
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss / len(dataloader):.4f}")
+            print(f"Epoch [{epoch + 1}/{num_epochs}], "
+                  f"Flow Loss: {epoch_loss_flow / len(dataloader):.4f}, "
+                  f"Diffusion Loss: {epoch_loss_diffusion / len(dataloader):.4f}, "
+                  f"Denoising Loss: {epoch_loss_denoising / len(dataloader):.4f}")
 
     return flow_field, denoiser, diffusion_field
 
@@ -382,32 +451,10 @@ def generate_trajectory(
     return trajectory
 
 
-# Function to visualize the flow field along with the ground truth trajectory
-def visualize_trajectory_with_flow_field(model, trajectory):
-    t_values = trajectory[:, 0]
-    x_values = trajectory[:, 1]
-    y_values = trajectory[:, 2]
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(x_values, y_values, label="Ground Truth Trajectory", color="blue")
-
-    for t, x, y in zip(t_values, x_values, y_values):
-        X_tensor = torch.tensor([x, y], dtype=torch.float32)
-        flow = model(X_tensor).detach().numpy()
-        plt.arrow(x, y, flow[0], flow[1], color="red", head_width=0.05, head_length=0.1)
-
-    plt.xlabel("X")
-    plt.ylabel("Y")
-    plt.title("Ground Truth Trajectory with Flow Field")
-    plt.grid(True)
-    plt.axis("equal")
-    plt.legend()
-    plt.show()
-
-
 def visualize_flow_field_around_trajectory(
     model,
     trajectory,
+    diffusion_model=None,
     denoiser=None,  # Add the denoiser as an optional argument
     grid_size=5,
     grid_extent=0.5,
@@ -416,6 +463,7 @@ def visualize_flow_field_around_trajectory(
     traj_color="blue",
     flow_color="red",
     denoising_magnitude=1.0,
+    plot_ellipsoids=True,
 ):
     t_values = trajectory[:, 0]
     x_values = trajectory[:, 1]
@@ -435,20 +483,36 @@ def visualize_flow_field_around_trajectory(
         y_grid = np.linspace(y_min, y_max, grid_size)
         X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
 
+        # Plot ellipsoid if enabled and diffusion model is provided
+        if plot_ellipsoids and diffusion_model is not None:
+            X_tensor = torch.tensor([x, y], dtype=torch.float32)
+            diffusion_std = diffusion_model(X_tensor).detach().numpy()
+
+            # Create an ellipse for each point with width and height proportional to the std deviation
+            ellipse = patches.Ellipse(
+                (x, y),
+                width=2 * diffusion_std[0],  # 2 * std for width
+                height=2 * diffusion_std[1],  # 2 * std for height
+                edgecolor="purple",
+                facecolor="none",
+                linestyle="--",
+            )
+            plt.gca().add_patch(ellipse)
+
         for i in range(grid_size):
             for j in range(grid_size):
                 X_tensor = torch.tensor(
                     [X_grid[i, j], Y_grid[i, j]], dtype=torch.float32
                 )
-                
+
                 # Calculate f(X)
                 flow = model(X_tensor).detach().numpy()
-                
+
                 # Add the denoising direction if denoiser is provided
                 if denoiser:
                     denoise_correction = denoising_magnitude * denoiser(X_tensor).detach().numpy()
                     flow += denoise_correction  # Composite direction
-                
+
                 plt.arrow(
                     X_grid[i, j],
                     Y_grid[i, j],
@@ -493,13 +557,15 @@ def parse_args():
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=50,
+        default=40,
         help="Number of samples in the trajectory",
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=1000, help="Number of epochs for training"
+        "--num_epochs", type=int, default=4000, help="Number of epochs for training"
     )
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument(
+        "--batch_size", type=int, default=256, help="Batch size for training"
+    )
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for training')
     parser.add_argument(
         "--noise_std",
@@ -510,7 +576,7 @@ def parse_args():
     parser.add_argument(
         "--gt_noise_std",
         type=float,
-        default=0.005,
+        default=0.01,
         help="Standard deviation of Gaussian noise added to the ground truth trajectory",
     )
     parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance for solve_ivp')
@@ -530,7 +596,7 @@ def parse_args():
     parser.add_argument(
         '--denoising_magnitude',
         type=float,
-        default=2.5,
+        default=5.0,
         help='Scale factor for the denoising correction during inference'
     )
     args = parser.parse_args()
@@ -540,11 +606,11 @@ def parse_args():
 def main(args):
     # Simulate the trajectory with optional sharp turns and noise
     gt_trajectories = simulate_trajectory(
-        1,
+        2,
         args.num_samples,
         noise_std=args.gt_noise_std,
         sharp_turns=args.sharp_turns,
-        branching=args.branching  # Pass the branching flag
+        branching=args.branching,  # Pass the branching flag
     )
 
     # Train without denoising if --no-denoising is provided
@@ -605,6 +671,7 @@ def main(args):
         visualize_flow_field_around_trajectory(
             trained_model_no_denoiser,
             traj,  # Use the first trajectory for visualization
+            diffusion_model=diffusion_model_no_denoiser,
             grid_size=5,
             grid_extent=0.5,
             subsample_step=5,
@@ -617,6 +684,7 @@ def main(args):
     visualize_flow_field_around_trajectory(
         trained_model_no_denoiser,
         generated_trajectory_no_denoiser,
+        diffusion_model=diffusion_model_no_denoiser,
         grid_size=5,
         grid_extent=0.5,
         subsample_step=5,
@@ -646,6 +714,7 @@ def main(args):
             visualize_flow_field_around_trajectory(
                 trained_model_with_denoiser,
                 generated_trajectory_with_denoiser,
+                diffusion_model=diffusion_model_with_denoiser,
                 denoiser=denoiser,
                 grid_size=5,
                 grid_extent=0.5,
