@@ -184,39 +184,6 @@ class FlowMatchingDataset(Dataset):
             return clean_data, target_data, delta_t_tensor
 
 
-# # Update the negative log-likelihood function to accept delta_t dynamically
-# def negative_log_likelihood(f_pred, g_pred, dx_dt, delta_t, train_diffusion=True):
-#     """
-#     Compute the negative log-likelihood loss for the SDE with a vector-valued diffusion term.
-
-#     Args:
-#         f_pred (torch.Tensor): The predicted drift values (f(x)).
-#         g_pred (torch.Tensor): The predicted diffusion values (g(x)), assumed to be vector-valued.
-#         dx_dt (torch.Tensor): The observed trajectory finite-difference values.
-#         delta_t (torch.Tensor): The time step size for each data point.
-#         train_diffusion (bool): Whether the diffusion term is being trained.
-
-#     Returns:
-#         torch.Tensor: The computed negative log-likelihood loss.
-#     """
-#     # Drift loss term: sum over both components
-#     drift_loss = torch.sum(
-#         ((dx_dt - f_pred) ** 2 * delta_t.unsqueeze(1)) / (2 * g_pred**2 + 1e-6), dim=1
-#     )
-
-#     # Only include the normalization term if training diffusion
-#     if train_diffusion:
-#         norm_term = torch.sum(
-#             0.5 * torch.log(2 * torch.pi * g_pred**2 * delta_t.unsqueeze(1) + 1e-6), dim=1
-#         )
-#         nll = torch.sum(drift_loss + norm_term)
-#     else:
-#         # If not training diffusion, only use the drift loss term
-#         nll = torch.sum(drift_loss)
-
-#     return nll
-
-
 # Updated negative log-likelihood function for the improved training strategy
 def improved_negative_log_likelihood(f_pred, dx_dt):
     """
@@ -357,19 +324,37 @@ def train_flow_matching(
 
 class FlowSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
 
-    def __init__(self, model, diffusion_model, denoiser=None, denoising_magnitude=1.0):
+    def __init__(
+        self,
+        model,
+        diffusion_model,
+        denoiser=None,
+        denoising_magnitude=1.0,
+        noise_std=0.1,
+    ):
         super().__init__(noise_type="diagonal")
         self.model = model  # The drift model
         self.diffusion_model = diffusion_model  # The learned diffusion model
         self.denoiser = denoiser
         self.denoising_magnitude = denoising_magnitude  # Scaling factor for denoising
+        self.noise_std = noise_std
 
     # Drift term: f + c * denoising
     def f(self, t, X):
         with torch.no_grad():
             flow = self.model(X)
             if self.denoiser:
-                denoising = self.denoiser(X) * self.denoising_magnitude
+                # derivation of the denoising_coefficient involves using fokker-planck equation
+                # and Ito's lemma to derive the evolution of logP, and enforcing that the
+                # combined diffusion term is negative (probablility concentrate)
+                # we need to enforce that self.denoising_magnitude >= 1.0
+                denoising_coefficient = (
+                    0.5
+                    * torch.sum(self.g(t, X))
+                    * self.denoising_magnitude
+                    * self.noise_std**2
+                )
+                denoising = self.denoiser(X) * denoising_coefficient
                 flow += denoising
             return flow
 
@@ -389,7 +374,8 @@ def generate_trajectory(
     rtol=1e-1,
     atol=1e-2,
     use_sde=False,
-    denoising_magnitude=1.0  # Add denoising magnitude
+    denoising_magnitude=1.0,  # Add denoising magnitude
+    noise_std=0.1,
 ):
     global call_count
     call_count = 0  # Reset the counter at the beginning of each integration
@@ -407,8 +393,18 @@ def generate_trajectory(
 
     # SDE version: Wrap the model and diffusion model to count function calls
     class CountingFlowSDE(FlowSDE):
-        def __init__(self, model, diffusion_model, denoiser=None, denoising_magnitude=1.0):
-            super().__init__(model, diffusion_model, denoiser, denoising_magnitude)
+
+        def __init__(
+            self,
+            model,
+            diffusion_model,
+            denoiser=None,
+            denoising_magnitude=1.0,
+            noise_std=0.1,
+        ):
+            super().__init__(
+                model, diffusion_model, denoiser, denoising_magnitude, noise_std
+            )
 
         def f(self, t, X):
             global call_count
@@ -417,7 +413,13 @@ def generate_trajectory(
 
     if use_sde:
         # Use SDE solver with call counting
-        sde_model = CountingFlowSDE(model, diffusion_model, denoiser=denoiser, denoising_magnitude=denoising_magnitude)
+        sde_model = CountingFlowSDE(
+            model,
+            diffusion_model,
+            denoiser=denoiser,
+            denoising_magnitude=denoising_magnitude,
+            noise_std=noise_std,
+        )
         initial_point_tensor = torch.tensor(initial_point, dtype=torch.float32).unsqueeze(0)
         ts = torch.tensor(t_values, dtype=torch.float32)
         with torch.no_grad():
@@ -570,13 +572,13 @@ def parse_args():
     parser.add_argument(
         "--noise_std",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Standard deviation of Gaussian noise added for denoising",
     )
     parser.add_argument(
         "--gt_noise_std",
         type=float,
-        default=0.01,
+        default=0.025,
         help="Standard deviation of Gaussian noise added to the ground truth trajectory",
     )
     parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance for solve_ivp')
@@ -596,7 +598,7 @@ def parse_args():
     parser.add_argument(
         '--denoising_magnitude',
         type=float,
-        default=5.0,
+        default=2.0,
         help='Scale factor for the denoising correction during inference'
     )
     args = parser.parse_args()
@@ -604,6 +606,11 @@ def parse_args():
 
 
 def main(args):
+    if args.denoising_magnitude < 1.0 and args.use_sde:
+        print(
+            "Warning: denoising magnitude should be larger than 1.0 for SDE mode to compensate the diffusion term"
+        )
+
     # Simulate the trajectory with optional sharp turns and noise
     gt_trajectories = simulate_trajectory(
         2,
@@ -658,6 +665,7 @@ def main(args):
         atol=args.atol,
         use_sde=args.use_sde,
         denoising_magnitude=args.denoising_magnitude,
+        noise_std=args.noise_std,
     )
 
     # Ensure the trajectory has the time dimension (t, x, y)
@@ -695,7 +703,7 @@ def main(args):
 
     # Plot multiple Generated Trajectories with Denoiser (if enabled)
     if args.denoising_enabled:
-        for i in range(5):  # Generate and plot 10 trajectories
+        for i in range(20):  # Generate and plot 10 trajectories
             generated_trajectory_with_denoiser = generate_trajectory(
                 trained_model_with_denoiser,
                 diffusion_model_with_denoiser,  # Add diffusion model
@@ -706,6 +714,7 @@ def main(args):
                 atol=args.atol,
                 use_sde=args.use_sde,
                 denoising_magnitude=args.denoising_magnitude,
+                noise_std=args.noise_std,
             )
             # Concatenate the time values to create (t, x, y) format
             generated_trajectory_with_denoiser = np.column_stack(
@@ -728,7 +737,7 @@ def main(args):
     plt.xlabel("X")
     plt.ylabel("Y")
     plt.title("Comparison of Flow Fields and Trajectories")
-    plt.legend()
+    plt.legend(loc="best")
     plt.grid(True)
     plt.axis("equal")
     plt.show()
