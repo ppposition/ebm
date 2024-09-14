@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 from functools import partial
 import torch.nn.functional as F
+import torchvision
+from typing import Callable
 
-class MLP(nn.Module):
+'''class MLP(nn.Module):
     def __init__(self, input_dim:int, hidden_dim:int, hidden_depth:int, output_dim:int, dropout:float) -> None:
         super().__init__()
         dropout_layer = partial(nn.Dropout, p=dropout)
@@ -21,24 +23,56 @@ class MLP(nn.Module):
         x = torch.cat((act.flatten(start_dim=-2), obs.flatten(start_dim=-2)), dim=-1)
         output1 = self.layers1(x) + x
         output = output1 + self.layers2(output1)
-        return self.linear(output)
+        return self.linear(output)'''
 
 class MLP(nn.Module):
     def __init__(self, input_dim:int, hidden_dim:int, hidden_depth:int, output_dim:int, dropout:float) -> None:
         super().__init__()
         dropout_layer = partial(nn.Dropout, p=dropout)
-        layers1 = [nn.Linear(input_dim, hidden_dim), nn.ReLU(), dropout_layer()]
+        layers1 = [nn.Linear(input_dim, hidden_dim), nn.SiLU(), dropout_layer()]
         for _ in range(hidden_depth-1):
-            layers1 += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), dropout_layer()]
+            layers1 += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), dropout_layer()]
         layers1.append(nn.Linear(hidden_dim, output_dim))
         self.layers1 = nn.Sequential(*layers1)
     def forward(self, act, obs):
-        x = torch.cat((act.flatten(start_dim=-2), obs.flatten(start_dim=-2)), dim=-1)
+        x = torch.cat((act.flatten(start_dim=-2), act.flatten(start_dim=-2), obs.flatten(start_dim=-2)), dim=-1)
         return self.layers1(x)
+    
+class Conv1dBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kerner_size, n_groups=8) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=kerner_size, stride=1, padding=kerner_size//2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.SiLU()
+        )
+    def forward(self, x):
+        return self.block(x)
+    
+class MLP_Conv(nn.Module):
+    def __init__(self, input_dim:int, hidden_channel, hidden_dim:int, hidden_depth:int, output_dim:int, action_dim:int, dropout:float) -> None:
+        super().__init__()
+        dropout_layer = partial(nn.Dropout, p=dropout)
+        self.conv1 = Conv1dBlock(action_dim, hidden_channel, 3)
+        self.residual_conv = nn.Conv1d(hidden_channel, hidden_channel, 1) if action_dim != hidden_channel else nn.Identity()
+        self.downsample = nn.Conv1d(hidden_channel, action_dim, 3, 2, 1)
+        MLP_layers = [nn.Linear(input_dim, hidden_dim), nn.SiLU(), dropout_layer()]
+        for _ in range(hidden_depth-1):
+            MLP_layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), dropout_layer()]
+        MLP_layers.append(nn.Linear(hidden_dim, output_dim))
+        self.MLP = nn.Sequential(*MLP_layers)
+        
+    def forward(self, act, obs):
+        act = act.moveaxis(-1, -2)
+        
+        act_out = self.downsample(self.residual_conv(self.conv1(act))).flatten(start_dim=1)
+        x = torch.cat((act_out.flatten(start_dim=1), obs.flatten(start_dim=1)), dim=1)
+        return self.MLP(x)
 
 class MLP_cond(nn.Module):
-    def __init__(self, input_dim:int, hidden_dim:int, hidden_depth:int, output_dim:int, dropout:float, cond_dim:int) -> None:
+    def __init__(self, input_dim:int, hidden_dim:int, hidden_depth:int, output_dim:int, dropout:float, cond_dim:int, ) -> None:
         super().__init__()
+        self.conv1 = Conv1dBlock()
         dropout_layer = partial(nn.Dropout, p=dropout)
         layers1 = [nn.Linear(input_dim, hidden_dim), nn.Mish(), dropout_layer()]
         layers2 = [nn.Linear(input_dim, hidden_dim), nn.Mish(), dropout_layer()]
@@ -198,4 +232,73 @@ class SemiUnet(nn.Module):
             x = downsample(x)
         x = self.linear2(self.activate_func(self.linear1(x.flatten(start_dim=1))))
         return x
-    
+
+def get_resnet(name:str, weights=None, **kwargs) -> nn.Module:
+    func = getattr(torchvision.models, name)
+    resnet = func(weights=weights, **kwargs)
+    resnet.fc = torch.nn.Identity()
+    return resnet
+
+def replace_submodules(
+        root_module: nn.Module,
+        predicate: Callable[[nn.Module], bool],
+        func: Callable[[nn.Module], nn.Module]) -> nn.Module:
+    """
+    Replace all submodules selected by the predicate with
+    the output of func.
+
+    predicate: Return true if the module is to be replaced.
+    func: Return new module to use.
+    """
+    if predicate(root_module):
+        return func(root_module)
+
+    bn_list = [k.split('.') for k, m
+        in root_module.named_modules(remove_duplicate=True)
+        if predicate(m)]
+    for *parent, k in bn_list:
+        parent_module = root_module
+        if len(parent) > 0:
+            parent_module = root_module.get_submodule('.'.join(parent))
+        if isinstance(parent_module, nn.Sequential):
+            src_module = parent_module[int(k)]
+        else:
+            src_module = getattr(parent_module, k)
+        tgt_module = func(src_module)
+        if isinstance(parent_module, nn.Sequential):
+            parent_module[int(k)] = tgt_module
+        else:
+            setattr(parent_module, k, tgt_module)
+    # verify that all modules are replaced
+    bn_list = [k.split('.') for k, m
+        in root_module.named_modules(remove_duplicate=True)
+        if predicate(m)]
+    assert len(bn_list) == 0
+    return root_module
+
+def replace_bn_with_gn(
+    root_module: nn.Module,
+    features_per_group: int=16) -> nn.Module:
+    """
+    Relace all BatchNorm layers with GroupNorm.
+    """
+    replace_submodules(
+        root_module=root_module,
+        predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+        func=lambda x: nn.GroupNorm(
+            num_groups=x.num_features//features_per_group,
+            num_channels=x.num_features)
+    )
+    return root_module
+
+class EBMConvMLP(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.cnn = get_resnet('resnet18', weights=None)
+        self.linear = nn.Linear(512, 5)
+        self.mlp = MLP(**config['mlp_config'])
+        
+    def forward(self, act, obs):
+        
+        feature = self.linear(self.cnn(obs.flatten(end_dim=1))).reshape(obs.shape[0], -1)
+        return self.mlp(torch.cat([act.flatten(-2), feature], dim=-1)) 

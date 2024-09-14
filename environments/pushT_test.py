@@ -261,16 +261,11 @@ class PushTEnv(gym.Env):
                 rs.randint(100, 400), rs.randint(100, 400),
                 rs.randn() * 2 * np.pi - np.pi
                 ])'''
-            '''state = np.array([
-                100, 100,
-                150, 150,
-                0.1
-            ])'''
             state = np.array([
-                rs.randint(100, 450), rs.randint(100, 450),
-                rs.randint(150, 400), rs.randint(150, 400),
-                rs.randn() * 2 * np.pi - np.pi
-                ])
+                100, 100,
+                256, 256,
+                0.77
+            ])
         self._set_state(state)
 
         obs = self._get_obs()

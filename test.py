@@ -13,9 +13,9 @@ import collections
 import pickle
 import os
 
-def generate_path(model, device, stats, path, action_dim, pred_horizon, action_horizon, obs_horizon, obs_dim, sample_method, sample_dic, max_steps=200):
+def generate_path(model, device, stats, path, action_dim, pred_horizon, action_horizon, obs_horizon, obs_dim, sample_method, sample_dic, max_steps=300):
     env = PushTEnv()
-    env.seed(10000)
+    #env.seed(10000)
     obs, inf = env.reset()
     
     obs_deque = collections.deque(
@@ -54,15 +54,20 @@ def generate_path(model, device, stats, path, action_dim, pred_horizon, action_h
                 step_idx += 1
                 pbar.update(1)
                 pbar.set_postfix(reward=reward)
+                if reward==1:
+                    print(obs)
                 if step_idx>max_steps:
                     done = True
                 if done:
                     break
                 
     print('Score:', max(rewards))
+    vwrite(os.path.join(path, f'vis.mp4'), imgs)
     #from Ipython.display import Video
-    vwrite(os.path.join(path, 'vis.mp4'), imgs)
-    #Video('vis.mp4', embed=True, width=256, height=256)
+    '''if max(rewards)<0.8:
+        order = len(os.listdir(path))
+        vwrite(os.path.join(path, f'vis{order}.mp4'), imgs)'''
+    Video('vis.mp4', embed=True, width=256, height=256)
     return max(rewards)
 
 if __name__=='__main__':
@@ -88,11 +93,22 @@ if __name__=='__main__':
     with open('configs/models.yaml', 'r') as file:
         model_config = yaml.safe_load(file)[args.net]
         if args.net=='MLP':
-            model = MLP(input_dim=data_config['obs_horizon']*data_config['obs_dim']+data_config['pred_horizon']*data_config['action_dim'], **model_config)
+            model = MLP(input_dim=data_config['obs_horizon']*data_config['obs_dim']+2*data_config['pred_horizon']*data_config['action_dim'], **model_config)
         elif args.net=='MLP_cond':
             model = MLP_cond(input_dim=data_config['pred_horizon']*data_config['action_dim'],cond_dim=data_config['obs_horizon']*data_config['obs_dim'], **model_config)
     model.load_state_dict(torch.load(args.parameter))
     if not os.path.exists(args.path):
         os.mkdir(args.path)
-    generate_path(model, device, stat, args.path, 2, noise_scale=0.5)
+    result_80 = 0
+    result_90 = 0
+    for i in range(50):
+        reward = generate_path(model, device, stat, args.path, **data_config, sample_method=args.sample, sample_dic=sample_config)
+        if reward>=0.8:
+            result_80 += 1
+            if reward>=0.9:
+                result_90 += 1
+    with open(os.path.join(args.path,'result.txt'), 'w') as f:
+        f.write("noise_scale:{}\n".format(sample_config['noise_scale']))
+        f.write("rate_80:"+str(result_80/50)+'\n')
+        f.write("rate_90:"+str(result_90/50))
     
